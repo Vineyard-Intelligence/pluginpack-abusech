@@ -2,7 +2,7 @@
   "identifier": "run.vineyard.pluginpacks.abusech",
   "content_type": "vineyard:pluginpack",
   "name": "abuse.ch",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "summary": "abuse.ch lookups: MalwareBazaar samples, ThreatFox indicators with confidence and reporter, URLhaus distribution URLs and payloads, and SSLBL-listed C2 certificates. Needs a free abuse.ch Auth-Key (SSLBL does not). Desktop only.",
   "description": "For the malware side of an investigation: what a sample is and when abuse.ch first saw it, which family a hash, IP, domain or URL was reported for and by whom, where a payload was spread from, and which TLS certificates SSLBL has seen on C2 servers. Families land on IP Classification's nodes, so its C2s and ThreatFox's meet.\n\n**Needs:** a free abuse.ch Auth-Key (https://auth.abuse.ch/), one for every plugin. SSLBL Certificate Check works without one.\n\n**Who sees it:** abuse.ch (Spamhaus) receives every hash, IP, domain and URL looked up, with the analyst's Auth-Key. The SSLBL list is downloaded whole and matched locally, so checked certificates are not sent. The hosts under investigation are never contacted.\n\n**Terms** (https://abuse.ch/terms-of-use/): MalwareBazaar, ThreatFox and URLhaus are free for not-for-profit use (§3.1); for-profit use may need a Spamhaus subscription (§4.1). SSLBL is CC0 (§3.4). The data may not train or improve an AI model without Spamhaus' consent (§7.3): check how the AI panel's provider treats what it is sent.\n\n**Read results with care:**\n\n- ThreatFox's confidence (0–100) is the reporter's own claim, not a verdict.\n- \"Unknown malware\" and similar placeholders make no family node.\n- SSLBL's C2 IP list was deprecated on 2025-01-03, so IPs are not checked against SSLBL.\n\n**Data and licences:** abuse.ch data, under its terms; the pack bundles none of its own.\n\n**Source:** https://github.com/Vineyard-Intelligence/pluginpack-abusech (Apache-2.0)",
   "author": {
@@ -27,7 +27,7 @@
       "identifier": "run.vineyard.plugins.abusech_malwarebazaar",
       "content_type": "vineyard:plugin",
       "name": "MalwareBazaar Hash Lookup",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "description": "Looks up each selected File Hash (SHA-256, SHA-1 or MD5) in abuse.ch MalwareBazaar and writes what it holds on the sample onto the node: the missing hashes and size, and mb_signature, mb_tags, mb_first_seen, mb_last_seen, mb_file_name, mb_file_type, mb_reporter, mb_origin_country, mb_delivery_method, mb_imphash, mb_tlsh, mb_ssdeep, mb_yara and mb_url. The signature becomes a Malware (or Tool) family linked 'classified as', named as IP Classification and ThreatFox name it. Needs an abuse.ch Auth-Key. Desktop only.",
       "icon": "bug",
       "platforms": {
@@ -122,7 +122,7 @@
       "identifier": "run.vineyard.plugins.abusech_threatfox",
       "content_type": "vineyard:plugin",
       "name": "ThreatFox IOC Lookup",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "description": "Searches abuse.ch ThreatFox for each selected IP Address, Domain, URL or File Hash. Each ThreatFox record that lists it becomes an Indicator (the IOC as ThreatFox lists it, an IP with its port) linked to it by refers_to, carrying valid_from (first seen), threatfox_confidence (0-100), threatfox_reporter, threatfox_threat_type, threatfox_last_seen, threatfox_tags and threatfox_url, and linked 'indicates' to its Malware or Tool family, named as IP Classification names it (DcRAT, Cobalt Strike as a Tool). For a File Hash it also adds the indicators ThreatFox ties to the sample, usually its C2, linked 'associated in ThreatFox with', each referring to its IP Address, Domain or URL. Placeholder families ('Unknown malware') make no node. Up to max_records (default 50) indicators per node. Needs an abuse.ch Auth-Key. Desktop only.",
       "icon": "crosshair",
       "platforms": {
@@ -270,7 +270,7 @@
       "identifier": "run.vineyard.plugins.abusech_urlhaus",
       "content_type": "vineyard:plugin",
       "name": "URLhaus Lookup",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "description": "Looks up each selected URL, Domain, IP Address or File Hash in abuse.ch URLhaus, the tracker of malware-distribution URLs. A URL gets urlhaus_status (online/offline), urlhaus_threat, urlhaus_first_seen, urlhaus_tags, urlhaus_reporter, urlhaus_blacklists and urlhaus_url, and each payload it served becomes a File Hash linked 'served file'. A Domain or IP Address gets urlhaus_url_count and urlhaus_first_seen, and the URLs URLhaus lists on it become URLs linked 'hosts'. A File Hash gets urlhaus_signature, urlhaus_file_type, urlhaus_first_seen, urlhaus_last_seen and urlhaus_url_count, and the URLs that served it become URLs linked 'served file'. A payload's signature becomes a Malware or Tool family linked 'classified as'. Up to max_items (default 25) URLs or payloads per node. Needs an abuse.ch Auth-Key. Desktop only.",
       "icon": "link",
       "platforms": {
@@ -403,7 +403,7 @@
       "identifier": "run.vineyard.plugins.abusech_sslbl",
       "content_type": "vineyard:plugin",
       "name": "SSLBL Certificate Check",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "description": "Checks each selected TLS Certificate against the abuse.ch SSLBL SSL Certificate Blacklist, which lists certificates seen on botnet C2 and malware-distribution servers by SHA-1. Needs the certificate's fingerprint_sha1, which Shodan Host, Censys Host Lookup and the VirusTotal reports write; a certificate without one is counted, not checked. A listed certificate gets sslbl_listed (listing date) and sslbl_reason, and the family SSLBL names becomes a Malware or Tool linked 'used as C2', 'used for malware distribution' or 'used for MITM'. Downloads the whole list once per run, so which certificates were checked is not sent anywhere. The Auth-Key is optional: SSLBL needs none, and with one family names are matched to ThreatFox's. Desktop only.",
       "icon": "shield-alert",
       "platforms": {

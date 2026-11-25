@@ -49,7 +49,7 @@ const pack: VineyardPluginPack & {
     identifier: 'run.vineyard.pluginpacks.abusech',
     content_type: 'vineyard:pluginpack',
     name: 'abuse.ch',
-    version: '1.1.0',
+    version: '1.2.0',
     summary:
         'abuse.ch lookups: MalwareBazaar samples, ThreatFox indicators with confidence and reporter, URLhaus distribution URLs and payloads, and SSLBL-listed C2 certificates. Needs a free abuse.ch Auth-Key (SSLBL does not). Desktop only.',
     description: PAGE,

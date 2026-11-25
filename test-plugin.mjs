@@ -574,9 +574,12 @@ const cert = (id, sha1) => ({ id, type: 'infrastructure.certificate', data: { fi
 //     up: MalwareBazaar op "malwarebazaar", URLhaus op "urlhaus", ThreatFox one op per search
 //     ("threatfox" for an IP/Domain/URL, "threatfox_<alg>" per hash and "threatfox_associated" for
 //     search_hash on a File Hash), so no answer replaces another in the node's `latest` slot.
-//   - A "not found" answer (HTTP 200, hash_not_found / no_result / no_results) is kept: it is a
-//     finding. A key failure (401, 403, unknown_auth_key), a 5xx, a retried 429 and the shared
-//     malware list are never kept. Derived nodes (indicators, payloads, URLs, families) get none.
+//   - Only a 2xx answer with query_status "ok" that carries something about the node is kept. A
+//     "not found" (hash_not_found / no_result / no_results), an illegal_search_term, an "ok" with an
+//     empty data list and a ThreatFox "ok" whose records are all someone else's IOC keep nothing:
+//     they add nothing to the node (analyst's decision, 2026-11-25, reversing 1.1.0, which kept
+//     them as findings). A key failure (401, 403, unknown_auth_key), a 5xx, a retried 429 and the
+//     shared malware list are never kept. Derived nodes (indicators, payloads, URLs, families) get none.
 //   - No slice and no synthetic body (analyst's decision, 2026-11-25): one request is about one
 //     node in this pack, and its body is the response text unchanged.
 //   - Nothing handed to retain carries the Auth-Key, the request or its URL.
@@ -633,8 +636,23 @@ const withRetain = (opts, spy = retainSpy()) => {
 {
     const { t, spy } = withRetain({ nodes: { f1: fileNode({ sha256: SHA256 }) }, respond: () => ({ status: 200, body: { query_status: 'hash_not_found' } }) });
     const r = await P.malwarebazaar.run(t.ctx);
-    check('retain mb: hash_not_found is kept on the hash, as evidence', where(spy.calls) === 'f1:malwarebazaar' && JSON.parse(spy.calls[0][2].body).query_status === 'hash_not_found');
+    check('retain mb: hash_not_found keeps nothing', spy.calls.length === 0);
     check('retain mb: …and is still counted a real negative', r.counts.not_found === 1 && t.graph.updates.length === 0);
+    check('retain mb: …and logs nothing about raw results', !t.logs.some((l) => /not kept/.test(l)));
+}
+{
+    // Empty or a miss: nothing kept. A sample record next to them still is, whole.
+    const mbBody = { query_status: 'ok', data: [{ ...mbRecord, signature: null }] };
+    const byHash = {
+        [SHA256]: { status: 200, body: { query_status: 'hash_not_found' } },
+        [MD5]: { status: 200, body: { query_status: 'ok', data: [] } },
+        [SHA1]: { status: 200, body: mbBody, headers: RESPONSE_HEADERS },
+    };
+    const nodes = { a: { ...fileNode({ sha256: SHA256 }), id: 'a' }, b: { id: 'b', type: 'threat.file_hash', data: { md5: MD5 } }, c: { id: 'c', type: 'threat.file_hash', data: { sha1: SHA1 } } };
+    const { t, spy } = withRetain({ nodes, respond: (url, b) => byHash[b.hash] });
+    await run(P.malwarebazaar, t);
+    check('retain mb: hash_not_found and an empty ok keep nothing, a record is kept', where(spy.calls) === 'c:malwarebazaar');
+    check('retain mb: the kept answer is the response text, whole', spy.calls[0]?.[2].status === 200 && spy.calls[0][2].body === JSON.stringify(mbBody));
 }
 {
     for (const [label, answer] of [
@@ -653,7 +671,7 @@ const withRetain = (opts, spy = retainSpy()) => {
     let n = 0;
     const { t, spy } = withRetain({
         nodes: { f1: fileNode({ sha256: SHA256 }) },
-        respond: () => (n++ === 0 ? { status: 429, body: { throttled: true }, headers: { 'retry-after': '0.001' } } : { status: 200, body: { query_status: 'hash_not_found' } }),
+        respond: () => (n++ === 0 ? { status: 429, body: { throttled: true }, headers: { 'retry-after': '0.001' } } : { status: 200, body: { query_status: 'ok', data: [{ ...mbRecord, signature: null }] } }),
     });
     await P.malwarebazaar.run(t.ctx);
     check('retain mb: a retried 429 is not kept, only the final answer', t.net.calls.length === 2 && spy.calls.length === 1 && spy.calls[0][2].status === 200 && !spy.calls[0][2].body.includes('throttled'));
@@ -694,8 +712,8 @@ const withRetain = (opts, spy = retainSpy()) => {
         },
     });
     await P.threatfox.run(t.ctx);
-    check('retain tf: a File Hash keeps each search under its own op, all on the file', where(spy.calls) === 'f1:threatfox_sha256,f1:threatfox_sha1,f1:threatfox_md5,f1:threatfox_associated');
-    check('retain tf: the no_result answers are kept too', spy.calls.filter((c) => JSON.parse(c[2].body).query_status === 'no_result').length === 2);
+    check('retain tf: a File Hash keeps each answering search under its own op, all on the file', where(spy.calls) === 'f1:threatfox_sha256,f1:threatfox_associated');
+    check('retain tf: the sha1 and md5 no_result answers keep nothing', !spy.calls.some((c) => JSON.parse(c[2].body).query_status !== 'ok'));
     check('retain tf: every op fits the host rule', spy.calls.every((c) => /^[a-z][a-z0-9_]{0,63}$/.test(c[1])));
     check('retain tf: no Auth-Key or request in any of them', leaks(spy.calls).length === 0);
 }
@@ -706,11 +724,38 @@ const withRetain = (opts, spy = retainSpy()) => {
         respond: (url) => (url.endsWith('/url/') ? { status: 200, body: urlBody, headers: RESPONSE_HEADERS } : { status: 200, body: { query_status: 'no_results' } }),
     });
     await P.urlhaus.run(t.ctx);
-    check('retain uh: one call per node looked up, op urlhaus, on that node', where(spy.calls) === 'u1:urlhaus,d1:urlhaus');
+    check('retain uh: one call, op urlhaus, on the URL that URLhaus lists', where(spy.calls) === 'u1:urlhaus');
     check('retain uh: the URL answer whole, as sent', spy.calls[0]?.[2].body === JSON.stringify(urlBody));
-    check('retain uh: no_results on the domain is kept', JSON.parse(spy.calls[1]?.[2].body ?? '{}').query_status === 'no_results');
+    check('retain uh: no_results on the domain keeps nothing', !spy.calls.some((c) => c[0] === 'd1'));
     check('retain uh: the payload node made from it gets no copy', t.graph.createdNodes.length === 1 && !spy.calls.some((c) => c[0] === t.graph.createdNodes[0].id));
     check('retain uh: shape, and no Auth-Key or request', shapeOk(spy.calls) && leaks(spy.calls).length === 0);
+}
+{
+    // Every ThreatFox miss shape keeps nothing; an answer with the node's record is still kept.
+    const ownBody = { query_status: 'ok', data: [tfRec({ ioc: '1.2.3.8:443' })] };
+    const byTerm = {
+        '1.2.3.4': { status: 200, body: { query_status: 'no_result', data: 'Your search did not yield any results' } },
+        '1.2.3.5': { status: 200, body: { query_status: 'illegal_search_term', data: 'Your search term is not valid' } },
+        '1.2.3.6': { status: 200, body: { query_status: 'ok', data: [] } },
+        // The loose IP search answering someone else's IOC only: nothing about this IP.
+        '1.2.3.7': { status: 200, body: { query_status: 'ok', data: [tfRec({ id: '9', ioc: '11.2.3.70:80' })] } },
+        '1.2.3.8': { status: 200, body: ownBody, headers: RESPONSE_HEADERS },
+    };
+    const ipNode = (id, addr) => ({ id, type: 'infrastructure.ip_address', data: { ip_address: addr } });
+    const nodes = { m1: ipNode('m1', '1.2.3.4'), m2: ipNode('m2', '1.2.3.5'), m3: ipNode('m3', '1.2.3.6'), m4: ipNode('m4', '1.2.3.7'), m5: ipNode('m5', '1.2.3.8') };
+    const { t, spy } = withRetain({ nodes, respond: (url, b) => byTerm[b.search_term] });
+    const r = await run(P.threatfox, t);
+    check('retain tf: no_result, illegal_search_term, an empty ok and a near-miss-only ok keep nothing', where(spy.calls) === 'm5:threatfox');
+    check("retain tf: the answer with the node's record is kept whole, as sent", spy.calls[0]?.[2].body === JSON.stringify(ownBody));
+    check('retain tf: …and the run maps it as before', !r.error && t.graph.createdNodes.some((n) => n.type === 'threat.indicator' && n.data?.value === '1.2.3.8:443'));
+}
+{
+    // Answers that are not 2xx never reach retain, whatever they say.
+    for (const P_ of [P.threatfox, P.urlhaus]) {
+        const { t, spy } = withRetain({ nodes: { ip1 }, respond: () => ({ status: 404, body: { query_status: 'ok', data: [tfRec({})] } }) });
+        await run(P_, t);
+        check(`retain ${P_.manifest.identifier.slice(-8)}: a 404 keeps nothing`, spy.calls.length === 0);
+    }
 }
 {
     // SSLBL downloads one list about every listed certificate: nothing in it is one node's answer.
@@ -737,7 +782,7 @@ const withRetain = (opts, spy = retainSpy()) => {
     check("retain throw: logged once, without the host's message", h.logs.filter((l) => /Raw malwarebazaar result not kept/.test(l)).length === 1 && !h.logs.some((l) => /blew up/.test(l)));
 }
 {
-    check('pack version is 1.1.0', pack.version === '1.1.0');
+    check('pack version is 1.2.0', pack.version === '1.2.0');
 }
 
 for (const n of fail) console.log('FAIL', n);

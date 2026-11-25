@@ -206,12 +206,13 @@ const keepNoted = new WeakMap<HostContext, Set<string>>();
  *   - a refusal (over budget, a config value seen in the body) or a throw costs the raw copy,
  *     never the run: the mapped fields are already staged and are what the analyst ran this for.
  *
- * A "not found" answer (HTTP 200, query_status hash_not_found / no_result / no_results) IS kept:
- * "abuse.ch had nothing on this on this date" is itself a finding. Auth failures never get here.
+ * Only an answer that carries something about the node is kept: see carriesFinding. A call site
+ * that filters the records further (ThreatFox's loose IP search) decides before calling here.
  */
-export async function keep(ctx: HostContext, nodeId: string, op: string, raw: RawAnswer): Promise<void> {
+export async function keep(ctx: HostContext, nodeId: string, op: string, answer: { json: any; raw: RawAnswer }): Promise<void> {
     if (typeof ctx.retain !== 'function') return;
-    if (!(raw.status > 0)) return;
+    if (!carriesFinding(answer.raw.status, answer.json)) return;
+    const raw = answer.raw;
     let reason = '';
     try {
         const out = await ctx.retain(nodeId, op, { status: raw.status, headers: { ...raw.headers }, body: raw.text });
@@ -225,6 +226,26 @@ export async function keep(ctx: HostContext, nodeId: string, op: string, raw: Ra
     if (noted.has(`${op}\0${reason}`)) return;
     noted.add(`${op}\0${reason}`);
     ctx.progress?.log?.(`Raw ${op} result not kept — ${reason}`);
+}
+
+/**
+ * Whether an abuse.ch answer is worth keeping on the node it is about: a 2xx whose query_status is
+ * "ok" — the one status MalwareBazaar get_info, ThreatFox search_ioc / search_hash and URLhaus
+ * url / host / payload use for an answer with data — and whose `data`, where the endpoint has one,
+ * is not an empty list.
+ *
+ * Everything else keeps nothing. Until 1.2.0 a "not found" (hash_not_found, no_result, no_results)
+ * was kept as a finding, as was illegal_search_term; those answers add nothing to the node, and
+ * the analyst found nodes filling up with stored copies that said only "nothing here" (analyst's
+ * decision, 2026-11-25). The run's summary still counts them as real negatives. Non-2xx answers
+ * never reach here (abusePostRaw throws on them) and are refused here as well: the app refuses
+ * them too, and each refusal it logs is noise.
+ */
+export function carriesFinding(status: number, json: any): boolean {
+    if (!(status >= 200 && status < 300)) return false;
+    if (!json || typeof json !== 'object' || json.query_status !== 'ok') return false;
+    if (Array.isArray(json.data) && json.data.length === 0) return false;
+    return true;
 }
 
 /** `query_status` values that mean "looked, and abuse.ch has nothing": a real negative. */

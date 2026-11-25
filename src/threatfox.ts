@@ -175,24 +175,39 @@ export function groupByIoc(recs: TfRecord[], cap: number): { groups: Array<[stri
 }
 
 /**
- * One ThreatFox search for one selected node, its answer kept whole on that node under `op`.
+ * One ThreatFox search for one selected node, returning the records `mine` accepts, its answer kept
+ * whole on that node under `op` when at least one record is the node's.
  *
  * Whole, even when it lists several IOC records (one IP on several ports, one IOC reported twice):
- * the request named this node's value and nothing else, so every record in the answer is ThreatFox
- * answering about it, near-misses of the loose IP search included — which records were taken is
- * the plugin's mapping, and the indicator nodes made from them get no copy (spec §5-3). A
- * no_result is kept too; so is an illegal_search_term, which is ThreatFox's answer about the value.
+ * the request named this node's value and nothing else, so the answer is ThreatFox answering about
+ * it, near-misses of the loose IP search included — which records were taken is the plugin's
+ * mapping, and the indicator nodes made from them get no copy (spec §5-3).
+ *
+ * Nothing is kept for a no_result, an illegal_search_term or any other status but "ok" (keep in
+ * common.ts), nor for an "ok" whose records are all someone else's indicator (the loose IP search
+ * answering 11.2.3.45 for 1.2.3.4): those answers say nothing about the node, and kept they only
+ * filled it with noise (analyst's decision, 2026-11-25; until 1.2.0 a no_result was kept).
  */
-async function search(ctx: HostContext, key: string, body: Record<string, unknown>, nodeId: string, op: string): Promise<TfRecord[]> {
-    const { json: res, raw } = await abusePostRaw(ctx, TF_API, { json: body }, key);
-    await keep(ctx, nodeId, op, raw);
+async function search(
+    ctx: HostContext,
+    key: string,
+    body: Record<string, unknown>,
+    nodeId: string,
+    op: string,
+    mine: (r: TfRecord) => boolean = () => true,
+): Promise<TfRecord[]> {
+    const answer = await abusePostRaw(ctx, TF_API, { json: body }, key);
+    const res = answer.json;
+    const recs = res.query_status === 'ok' && Array.isArray(res.data) ? (res.data as TfRecord[]) : [];
+    const own = recs.filter(mine);
+    if (own.length) await keep(ctx, nodeId, op, answer);
     if (isMiss(res.query_status)) return [];
     if (res.query_status !== 'ok') {
         // illegal_search_term and the like: a value ThreatFox will not search, not an error.
         ctx.progress?.log?.(`ThreatFox: ${String(body.search_term ?? body.hash ?? '')} — ${res.query_status ?? 'no status'}`);
         return [];
     }
-    return Array.isArray(res.data) ? (res.data as TfRecord[]) : [];
+    return own;
 }
 
 export const threatFox = definePlugin({
@@ -200,7 +215,7 @@ export const threatFox = definePlugin({
         identifier: 'run.vineyard.plugins.abusech_threatfox',
         content_type: 'vineyard:plugin',
         name: 'ThreatFox IOC Lookup',
-        version: '1.1.0',
+        version: '1.2.0',
         description:
             "Searches abuse.ch ThreatFox for each selected IP Address, Domain, URL or File Hash. Each ThreatFox record that lists it becomes an Indicator (the IOC as ThreatFox lists it, an IP with its port) linked to it by refers_to, carrying valid_from (first seen), threatfox_confidence (0-100), threatfox_reporter, threatfox_threat_type, threatfox_last_seen, threatfox_tags and threatfox_url, and linked 'indicates' to its Malware or Tool family, named as IP Classification names it (DcRAT, Cobalt Strike as a Tool). For a File Hash it also adds the indicators ThreatFox ties to the sample, usually its C2, linked 'associated in ThreatFox with', each referring to its IP Address, Domain or URL. Placeholder families ('Unknown malware') make no node. Up to max_records (default 50) indicators per node. Needs an abuse.ch Auth-Key. Desktop only.",
         icon: 'crosshair',
@@ -297,7 +312,7 @@ export const threatFox = definePlugin({
             ctx.progress?.set?.({ percent: Math.round((i / nodes.length) * 100), message: `ThreatFox: ${String(searches[0].body.search_term)}` });
             try {
                 const own: TfRecord[] = [];
-                for (const s of searches) own.push(...(await search(ctx, key, s.body, node.id, s.op)).filter(s.mine));
+                for (const s of searches) own.push(...(await search(ctx, key, s.body, node.id, s.op, s.mine)));
                 const { groups, dropped } = groupByIoc(own, cap);
                 capped += dropped;
                 for (const [ioc, recs] of groups) {
