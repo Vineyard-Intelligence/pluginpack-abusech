@@ -3,11 +3,12 @@ import { definePlugin } from './sdk';
 import type { GraphNode, HostContext, RunResult } from './sdk';
 import {
     abortErr,
-    abusePost,
+    abusePostRaw,
     GRAPH_SCOPES,
     infra,
     isMiss,
     ItemFailed,
+    keep,
     KEY_CONFIG,
     LIFECYCLE,
     NETWORK,
@@ -82,7 +83,7 @@ export const urlhaus = definePlugin({
         identifier: 'run.vineyard.plugins.abusech_urlhaus',
         content_type: 'vineyard:plugin',
         name: 'URLhaus Lookup',
-        version: '1.0.0',
+        version: '1.1.0',
         description:
             "Looks up each selected URL, Domain, IP Address or File Hash in abuse.ch URLhaus, the tracker of malware-distribution URLs. A URL gets urlhaus_status (online/offline), urlhaus_threat, urlhaus_first_seen, urlhaus_tags, urlhaus_reporter, urlhaus_blacklists and urlhaus_url, and each payload it served becomes a File Hash linked 'served file'. A Domain or IP Address gets urlhaus_url_count and urlhaus_first_seen, and the URLs URLhaus lists on it become URLs linked 'hosts'. A File Hash gets urlhaus_signature, urlhaus_file_type, urlhaus_first_seen, urlhaus_last_seen and urlhaus_url_count, and the URLs that served it become URLs linked 'served file'. A payload's signature becomes a Malware or Tool family linked 'classified as'. Up to max_items (default 25) URLs or payloads per node. Needs an abuse.ch Auth-Key. Desktop only.",
         icon: 'link',
@@ -147,7 +148,12 @@ export const urlhaus = definePlugin({
             }
             ctx.progress?.set?.({ percent: Math.round((i / nodes.length) * 100), message: `URLhaus: ${req.label}` });
             try {
-                const res = await abusePost(ctx, UH_API + req.path, { form: req.form }, key);
+                const { json: res, raw } = await abusePostRaw(ctx, UH_API + req.path, { form: req.form }, key);
+                // The whole answer, on the node looked up: one URL, host or payload per request, so
+                // the URLs or payloads it lists are that node's, not a page of other nodes'. The
+                // nodes made from them are derived and get no copy (spec §5-3): the edge to this
+                // node is where they came from. A no_results is kept too.
+                await keep(ctx, node.id, 'urlhaus', raw);
                 if (isMiss(res.query_status)) {
                     absent++;
                     continue;

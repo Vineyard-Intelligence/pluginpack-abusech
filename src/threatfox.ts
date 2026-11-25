@@ -3,11 +3,12 @@ import { definePlugin } from './sdk';
 import type { GraphNode, HostContext, RunResult } from './sdk';
 import {
     abortErr,
-    abusePost,
+    abusePostRaw,
     GRAPH_SCOPES,
     infra,
     isMiss,
     ItemFailed,
+    keep,
     KEY_CONFIG,
     LIFECYCLE,
     NETWORK,
@@ -64,12 +65,27 @@ export interface TfRecord {
  * loosely, and every record is checked against the node either way: a near-miss record is someone
  * else's indicator, and linking it here would put a family on the wrong node.
  */
-export function ownSearches(node: GraphNode): Array<{ body: Record<string, unknown>; mine: (r: TfRecord) => boolean }> {
+export interface OwnSearch {
+    body: Record<string, unknown>;
+    mine: (r: TfRecord) => boolean;
+    /** The raw-result slot this search's answer is kept in (see keep in common.ts). */
+    op: string;
+}
+
+/**
+ * The ops a node's answers are kept under. One per search, not one per plugin: a File Hash is
+ * searched once per hash it carries and once more with search_hash, and a shared op would leave
+ * only the last of those answers (`latest` is replaced by the next call of the same op).
+ */
+const OP_IOC = 'threatfox';
+const OP_ASSOCIATED = 'threatfox_associated';
+
+export function ownSearches(node: GraphNode): OwnSearch[] {
     const d = node.data ?? {};
     switch (node.type) {
         case 'infrastructure.ip_address': {
             const ip = str(d.ip_address);
-            return ip ? [{ body: { query: 'search_ioc', search_term: ip }, mine: (r) => r.ioc_type === 'ip:port' && iocIsIp(r.ioc, ip) }] : [];
+            return ip ? [{ body: { query: 'search_ioc', search_term: ip }, mine: (r) => r.ioc_type === 'ip:port' && iocIsIp(r.ioc, ip), op: OP_IOC }] : [];
         }
         case 'infrastructure.domain': {
             // Searched in punycode, and a record matched in either form: the node may hold the
@@ -78,18 +94,18 @@ export function ownSearches(node: GraphNode): Array<{ body: Record<string, unkno
             if (!dom) return [];
             const names = new Set([dom, str(d.domain_name).toLowerCase().replace(/\.$/, '')]);
             const same = (ioc: unknown) => names.has(str(ioc).toLowerCase().replace(/\.$/, '')) || lookupHost(ioc) === dom;
-            return [{ body: { query: 'search_ioc', search_term: dom, exact_match: true }, mine: (r) => r.ioc_type === 'domain' && same(r.ioc) }];
+            return [{ body: { query: 'search_ioc', search_term: dom, exact_match: true }, mine: (r) => r.ioc_type === 'domain' && same(r.ioc), op: OP_IOC }];
         }
         case 'web.url': {
             const url = str(d.url);
-            return url ? [{ body: { query: 'search_ioc', search_term: url, exact_match: true }, mine: (r) => r.ioc_type === 'url' && str(r.ioc) === url }] : [];
+            return url ? [{ body: { query: 'search_ioc', search_term: url, exact_match: true }, mine: (r) => r.ioc_type === 'url' && str(r.ioc) === url, op: OP_IOC }] : [];
         }
         case 'threat.file_hash': {
             // ThreatFox lists a sample's hashes as separate IOCs (an md5, a sha1 and a sha256 record
             // for one MiniBrowse payload, measured), so each hash the node carries is its own search.
-            const out: Array<{ body: Record<string, unknown>; mine: (r: TfRecord) => boolean }> = [];
-            for (const h of [sha256Of(d.sha256), sha1Of(d.sha1), md5Of(d.md5)]) {
-                if (h) out.push({ body: { query: 'search_ioc', search_term: h, exact_match: true }, mine: (r) => str(r.ioc).toLowerCase() === h && /_hash$/.test(r.ioc_type ?? '') });
+            const out: OwnSearch[] = [];
+            for (const [alg, h] of [['sha256', sha256Of(d.sha256)], ['sha1', sha1Of(d.sha1)], ['md5', md5Of(d.md5)]] as const) {
+                if (h) out.push({ body: { query: 'search_ioc', search_term: h, exact_match: true }, mine: (r) => str(r.ioc).toLowerCase() === h && /_hash$/.test(r.ioc_type ?? ''), op: `${OP_IOC}_${alg}` });
             }
             return out;
         }
@@ -158,8 +174,18 @@ export function groupByIoc(recs: TfRecord[], cap: number): { groups: Array<[stri
     return { groups: all.slice(0, cap), dropped: Math.max(0, all.length - cap) };
 }
 
-async function search(ctx: HostContext, key: string, body: Record<string, unknown>): Promise<TfRecord[]> {
-    const res = await abusePost(ctx, TF_API, { json: body }, key);
+/**
+ * One ThreatFox search for one selected node, its answer kept whole on that node under `op`.
+ *
+ * Whole, even when it lists several IOC records (one IP on several ports, one IOC reported twice):
+ * the request named this node's value and nothing else, so every record in the answer is ThreatFox
+ * answering about it, near-misses of the loose IP search included — which records were taken is
+ * the plugin's mapping, and the indicator nodes made from them get no copy (spec §5-3). A
+ * no_result is kept too; so is an illegal_search_term, which is ThreatFox's answer about the value.
+ */
+async function search(ctx: HostContext, key: string, body: Record<string, unknown>, nodeId: string, op: string): Promise<TfRecord[]> {
+    const { json: res, raw } = await abusePostRaw(ctx, TF_API, { json: body }, key);
+    await keep(ctx, nodeId, op, raw);
     if (isMiss(res.query_status)) return [];
     if (res.query_status !== 'ok') {
         // illegal_search_term and the like: a value ThreatFox will not search, not an error.
@@ -174,7 +200,7 @@ export const threatFox = definePlugin({
         identifier: 'run.vineyard.plugins.abusech_threatfox',
         content_type: 'vineyard:plugin',
         name: 'ThreatFox IOC Lookup',
-        version: '1.0.0',
+        version: '1.1.0',
         description:
             "Searches abuse.ch ThreatFox for each selected IP Address, Domain, URL or File Hash. Each ThreatFox record that lists it becomes an Indicator (the IOC as ThreatFox lists it, an IP with its port) linked to it by refers_to, carrying valid_from (first seen), threatfox_confidence (0-100), threatfox_reporter, threatfox_threat_type, threatfox_last_seen, threatfox_tags and threatfox_url, and linked 'indicates' to its Malware or Tool family, named as IP Classification names it (DcRAT, Cobalt Strike as a Tool). For a File Hash it also adds the indicators ThreatFox ties to the sample, usually its C2, linked 'associated in ThreatFox with', each referring to its IP Address, Domain or URL. Placeholder families ('Unknown malware') make no node. Up to max_records (default 50) indicators per node. Needs an abuse.ch Auth-Key. Desktop only.",
         icon: 'crosshair',
@@ -271,7 +297,7 @@ export const threatFox = definePlugin({
             ctx.progress?.set?.({ percent: Math.round((i / nodes.length) * 100), message: `ThreatFox: ${String(searches[0].body.search_term)}` });
             try {
                 const own: TfRecord[] = [];
-                for (const s of searches) own.push(...(await search(ctx, key, s.body)).filter(s.mine));
+                for (const s of searches) own.push(...(await search(ctx, key, s.body, node.id, s.op)).filter(s.mine));
                 const { groups, dropped } = groupByIoc(own, cap);
                 capped += dropped;
                 for (const [ioc, recs] of groups) {
@@ -286,7 +312,7 @@ export const threatFox = definePlugin({
                 let neighbours = 0;
                 if (node.type === 'threat.file_hash') {
                     const h = sha256Of(node.data?.sha256) ?? md5Of(node.data?.md5);
-                    const recs = h ? await search(ctx, key, { query: 'search_hash', hash: h }) : [];
+                    const recs = h ? await search(ctx, key, { query: 'search_hash', hash: h }, node.id, OP_ASSOCIATED) : [];
                     // The file's own hash IOCs are already linked above, and a record can list the
                     // sample it IS among its own samples; neither is a neighbour.
                     const d = node.data ?? {};

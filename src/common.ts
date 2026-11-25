@@ -122,6 +122,23 @@ export type Body = { form: Record<string, string> } | { json: Record<string, unk
  * run: every later request would get the same answer.
  */
 export async function abusePost(ctx: HostContext, url: string, body: Body, key: string): Promise<any> {
+    return (await abusePostRaw(ctx, url, body, key)).json;
+}
+
+/** The final answer of one abusePost, as keep() hands it over: nothing about the request. */
+export interface RawAnswer {
+    status: number;
+    headers: Record<string, string>;
+    text: string;
+}
+
+/**
+ * abusePost, with the answer it decoded. Only the FINAL response leaves here: a 429 that was
+ * waited out says nothing about the indicator and is never returned in place of the answer, and
+ * an answer that ends the run (a missing or wrong key) or fails the item is thrown, not returned,
+ * so it can never be kept as evidence about a node.
+ */
+export async function abusePostRaw(ctx: HostContext, url: string, body: Body, key: string): Promise<{ json: any; raw: RawAnswer }> {
     const headers: Record<string, string> = { 'Auth-Key': key, Accept: 'application/json' };
     let payload: string;
     if ('form' in body) {
@@ -167,8 +184,47 @@ export async function abusePost(ctx: HostContext, url: string, body: Body, key: 
         }
         if (res.status < 200 || res.status >= 300) throw new ItemFailed(`${new URL(url).host} answered HTTP ${res.status}`);
         if (!json || typeof json !== 'object') throw new ItemFailed(`${new URL(url).host} answered with something that is not JSON`);
-        return json;
+        return { json, raw: { status: res.status, headers: { ...(res.headers ?? {}) }, text } };
     }
+}
+
+/** Refusals already logged in this run, so a budget refusal over 200 nodes is one line, not 200. */
+const keepNoted = new WeakMap<HostContext, Set<string>>();
+
+/**
+ * Keep one lookup's raw answer on the node it was about (plugin raw results, spec §5). Every call
+ * site goes through here, for four reasons:
+ *   - desktop builds before ctx.retain have none, and a bare call there is a TypeError that would
+ *     fail a run that otherwise works, so the check is `typeof`, not truthiness;
+ *   - only status, response headers and body are handed over, built afresh: nothing about the
+ *     request (the URL, the form or JSON it posted, the Auth-Key header) can ride along on an
+ *     object the host would have to trust;
+ *   - the body is the response's own text, never a slice or a re-serialised parse, so what is
+ *     kept is the answer abuse.ch sent and the host hashes those bytes. Each call site sends one
+ *     request per looked-up node, so no answer is about more than that node (analyst's decision,
+ *     2026-11-25: a slice cut from a larger answer is no longer the original and is not kept);
+ *   - a refusal (over budget, a config value seen in the body) or a throw costs the raw copy,
+ *     never the run: the mapped fields are already staged and are what the analyst ran this for.
+ *
+ * A "not found" answer (HTTP 200, query_status hash_not_found / no_result / no_results) IS kept:
+ * "abuse.ch had nothing on this on this date" is itself a finding. Auth failures never get here.
+ */
+export async function keep(ctx: HostContext, nodeId: string, op: string, raw: RawAnswer): Promise<void> {
+    if (typeof ctx.retain !== 'function') return;
+    if (!(raw.status > 0)) return;
+    let reason = '';
+    try {
+        const out = await ctx.retain(nodeId, op, { status: raw.status, headers: { ...raw.headers }, body: raw.text });
+        if (out && out.kept === false) reason = typeof out.reason === 'string' && out.reason ? out.reason : 'refused';
+    } catch {
+        reason = 'the host could not keep it';
+    }
+    if (!reason) return;
+    let noted = keepNoted.get(ctx);
+    if (!noted) keepNoted.set(ctx, (noted = new Set()));
+    if (noted.has(`${op}\0${reason}`)) return;
+    noted.add(`${op}\0${reason}`);
+    ctx.progress?.log?.(`Raw ${op} result not kept — ${reason}`);
 }
 
 /** `query_status` values that mean "looked, and abuse.ch has nothing": a real negative. */

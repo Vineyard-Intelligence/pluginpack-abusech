@@ -42,7 +42,7 @@ export const sslbl = definePlugin({
         identifier: 'run.vineyard.plugins.abusech_sslbl',
         content_type: 'vineyard:plugin',
         name: 'SSLBL Certificate Check',
-        version: '1.0.0',
+        version: '1.1.0',
         description:
             "Checks each selected TLS Certificate against the abuse.ch SSLBL SSL Certificate Blacklist, which lists certificates seen on botnet C2 and malware-distribution servers by SHA-1. Needs the certificate's fingerprint_sha1, which Shodan Host, Censys Host Lookup and the VirusTotal reports write; a certificate without one is counted, not checked. A listed certificate gets sslbl_listed (listing date) and sslbl_reason, and the family SSLBL names becomes a Malware or Tool linked 'used as C2', 'used for malware distribution' or 'used for MITM'. Downloads the whole list once per run, so which certificates were checked is not sent anywhere. The Auth-Key is optional: SSLBL needs none, and with one family names are matched to ThreatFox's. Desktop only.",
         icon: 'shield-alert',
@@ -71,6 +71,9 @@ export const sslbl = definePlugin({
             };
         }
 
+        // Not kept with ctx.retain (plugin raw results): the list is one answer about 11,261
+        // certificates, not about the one selected, and a row cut out of it would no longer be the
+        // answer SSLBL sent. Its rows are re-downloadable by anyone; the node keeps what matched.
         ctx.progress?.set?.({ percent: 5, message: 'Downloading the SSLBL certificate blacklist' });
         let text: string;
         try {

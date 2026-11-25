@@ -568,6 +568,178 @@ const cert = (id, sha1) => ({ id, type: 'infrastructure.certificate', data: { fi
     check('sslbl: a list with fewer rows than its END line says fails the run', !!r2.error && /4 of 11261 rows/.test(r2.error.message) && t2.graph.updates.length === 0);
 }
 
+// ================================================================ raw results: ctx.retain
+// Invariants, from the plugin raw results spec (§5, §9-1, §12):
+//   - Each lookup keeps its FINAL answer, whole and as the text abuse.ch sent, on the node it looked
+//     up: MalwareBazaar op "malwarebazaar", URLhaus op "urlhaus", ThreatFox one op per search
+//     ("threatfox" for an IP/Domain/URL, "threatfox_<alg>" per hash and "threatfox_associated" for
+//     search_hash on a File Hash), so no answer replaces another in the node's `latest` slot.
+//   - A "not found" answer (HTTP 200, hash_not_found / no_result / no_results) is kept: it is a
+//     finding. A key failure (401, 403, unknown_auth_key), a 5xx, a retried 429 and the shared
+//     malware list are never kept. Derived nodes (indicators, payloads, URLs, families) get none.
+//   - No slice and no synthetic body (analyst's decision, 2026-11-25): one request is about one
+//     node in this pack, and its body is the response text unchanged.
+//   - Nothing handed to retain carries the Auth-Key, the request or its URL.
+//   - A refusal object or a throw from retain never fails the run, and is logged once per reason.
+//   - A host without ctx.retain (every desktop build before it) runs exactly as before.
+const SECRET = 'abusech-SECRET-key-0123456789';
+const SECRET_CONFIG = { auth_key: SECRET };
+const RESPONSE_HEADERS = { 'content-type': 'application/json', date: 'Tue, 25 Nov 2026 01:00:00 GMT', 'x-request-id': 'rq-1' };
+
+function retainSpy(answer = async () => ({ kept: true })) {
+    const calls = [];
+    const fn = async (...args) => {
+        calls.push(args);
+        return answer(...args);
+    };
+    fn.calls = calls;
+    return fn;
+}
+/** What must never reach retain: the key, its header, the request (its URL, query and form). */
+const leaks = (calls) => {
+    const s = JSON.stringify(calls);
+    return [SECRET, 'Auth-Key', 'auth_key', '-api.abuse.ch', 'get_info', 'search_ioc', 'search_hash', 'search_term', 'malware_list'].filter((x) => s.includes(x));
+};
+const shapeOk = (calls) => calls.every((c) => Object.keys(c[2]).sort().join() === 'body,headers,status' && typeof c[2].body === 'string' && c[3] === undefined);
+const where = (calls) => calls.map((c) => `${c[0]}:${c[1]}`).join();
+const withRetain = (opts, spy = retainSpy()) => {
+    const t = ctxFor({ config: SECRET_CONFIG, ...opts });
+    t.ctx.retain = spy;
+    return { t, spy };
+};
+
+{
+    const mbBody = { query_status: 'ok', data: [{ ...mbRecord, signature: null }] };
+    const respond = () => ({ status: 200, body: mbBody, headers: RESPONSE_HEADERS });
+    const nodes = { f1: fileNode({ sha256: SHA256 }) };
+    const { t, spy } = withRetain({ nodes, respond });
+    const res = await P.malwarebazaar.run(t.ctx);
+    check('retain mb: one call, on the looked-up File Hash, op malwarebazaar', where(spy.calls) === 'f1:malwarebazaar');
+    check('retain mb: status, headers and the answer as the text MalwareBazaar sent', spy.calls[0]?.[2].status === 200 && spy.calls[0][2].body === JSON.stringify(mbBody) && spy.calls[0][2].headers.date === RESPONSE_HEADERS.date);
+    check('retain mb: a plain {status, headers, body}, no options', shapeOk(spy.calls));
+    check('retain mb: headers are a copy, not the response object', spy.calls[0]?.[2].headers !== RESPONSE_HEADERS);
+    check('retain mb: no Auth-Key, request or URL handed over', leaks(spy.calls).length === 0);
+    check('retain mb: the request really carried the Auth-Key', t.net.calls[0].headers['Auth-Key'] === SECRET);
+
+    const old = ctxFor({ nodes, config: SECRET_CONFIG, respond });
+    const oldRes = await P.malwarebazaar.run(old.ctx);
+    check('old host: no ctx.retain, the lookup runs as before', !('retain' in old.ctx) && JSON.stringify(oldRes) === JSON.stringify(res));
+    check('old host: …stages the same graph and says nothing about raw results', JSON.stringify(old.graph.updates) === JSON.stringify(t.graph.updates) && !old.logs.some((l) => /not kept/.test(l)));
+    const notFn = ctxFor({ nodes, respond });
+    notFn.ctx.retain = true;
+    const notFnRes = await run(P.malwarebazaar, notFn);
+    check('old host: a retain that is not a function is left alone', !notFnRes.error && notFnRes.counts.found === 1);
+}
+{
+    const { t, spy } = withRetain({ nodes: { f1: fileNode({ sha256: SHA256 }) }, respond: () => ({ status: 200, body: { query_status: 'hash_not_found' } }) });
+    const r = await P.malwarebazaar.run(t.ctx);
+    check('retain mb: hash_not_found is kept on the hash, as evidence', where(spy.calls) === 'f1:malwarebazaar' && JSON.parse(spy.calls[0][2].body).query_status === 'hash_not_found');
+    check('retain mb: …and is still counted a real negative', r.counts.not_found === 1 && t.graph.updates.length === 0);
+}
+{
+    for (const [label, answer] of [
+        ['a 401', { status: 401, body: { error: 'Unauthorized' } }],
+        ['a 403 unknown_auth_key', { status: 403, body: { query_status: 'unknown_auth_key' } }],
+        ['a 200 unknown_auth_key', { status: 200, body: { query_status: 'unknown_auth_key' } }],
+    ]) {
+        const { t, spy } = withRetain({ nodes: { f1: fileNode({ sha256: SHA256 }) }, respond: () => answer });
+        await run(P.malwarebazaar, t);
+        check(`retain mb: ${label} ends the run and keeps nothing`, spy.calls.length === 0);
+    }
+    const { t: t5, spy: s5 } = withRetain({ nodes: { f1: fileNode({ sha256: SHA256 }) }, respond: () => ({ status: 502, text: 'Bad Gateway' }) });
+    const r5 = await run(P.malwarebazaar, t5);
+    check('retain mb: a 5xx (no answer about the hash) is not kept', s5.calls.length === 0 && r5.counts?.failed === 1);
+
+    let n = 0;
+    const { t, spy } = withRetain({
+        nodes: { f1: fileNode({ sha256: SHA256 }) },
+        respond: () => (n++ === 0 ? { status: 429, body: { throttled: true }, headers: { 'retry-after': '0.001' } } : { status: 200, body: { query_status: 'hash_not_found' } }),
+    });
+    await P.malwarebazaar.run(t.ctx);
+    check('retain mb: a retried 429 is not kept, only the final answer', t.net.calls.length === 2 && spy.calls.length === 1 && spy.calls[0][2].status === 200 && !spy.calls[0][2].body.includes('throttled'));
+}
+{
+    // A signature outside the table makes the run fetch ThreatFox's malware list: that answer is
+    // about every family, not the hash, and is not kept anywhere.
+    const { t, spy } = withRetain({
+        nodes: { f1: fileNode({ sha256: SHA256 }) },
+        respond: (url) =>
+            url.includes('threatfox')
+                ? { status: 200, body: { query_status: 'ok', data: { 'win.agent_tesla': { malware_printable: 'Agent Tesla', malware_alias: 'AgentTesla' } } } }
+                : { status: 200, body: { query_status: 'ok', data: [{ ...mbRecord, signature: 'AgentTesla' }] } },
+    });
+    await P.malwarebazaar.run(t.ctx);
+    check('retain mb: the malware list fetched on the way is not kept', t.net.calls.length === 2 && where(spy.calls) === 'f1:malwarebazaar');
+}
+{
+    // One IP, one answer listing several IOC records (two ports, a second report, a loose-search
+    // near-miss): kept whole on the IP, exactly as sent; the indicators made from it get nothing.
+    const body = { query_status: 'ok', data: [tfRec({}), tfRec({ id: '2028601', ioc: '1.2.3.4:8443' }), tfRec({ id: '2028602', ioc: '11.2.3.45:80' })] };
+    const { t, spy } = withRetain({ nodes: { ip1 }, respond: () => ({ status: 200, body, headers: RESPONSE_HEADERS }) });
+    await P.threatfox.run(t.ctx);
+    check('retain tf: one call, on the looked-up IP, op threatfox', where(spy.calls) === 'ip1:threatfox');
+    check('retain tf: the whole answer, every record, as ThreatFox sent it', spy.calls[0]?.[2].body === JSON.stringify(body));
+    check('retain tf: indicators and families made from it get no copy', t.graph.createdNodes.length > 0 && !spy.calls.some((c) => t.graph.createdNodes.some((n) => n.id === c[0])));
+    check('retain tf: shape, and no Auth-Key or request', shapeOk(spy.calls) && leaks(spy.calls).length === 0 && t.net.calls[0].headers['Auth-Key'] === SECRET);
+}
+{
+    // A File Hash is searched once per hash and once with search_hash: each answer in its own op,
+    // so the md5 answer does not replace the sha256 one.
+    const { t, spy } = withRetain({
+        nodes: { f1: fileNode({ sha256: SHA256, sha1: SHA1, md5: MD5 }) },
+        respond: (url, b) => {
+            if (b.query === 'search_hash') return { status: 200, body: { query_status: 'ok', data: [tfRec({ id: '77', ioc: '5.6.7.8:443' })] } };
+            if (b.search_term === SHA256) return { status: 200, body: { query_status: 'ok', data: [tfRec({ id: '70', ioc: SHA256, ioc_type: 'sha256_hash' })] } };
+            return { status: 200, body: { query_status: 'no_result', data: 'Your search did not yield any results' } };
+        },
+    });
+    await P.threatfox.run(t.ctx);
+    check('retain tf: a File Hash keeps each search under its own op, all on the file', where(spy.calls) === 'f1:threatfox_sha256,f1:threatfox_sha1,f1:threatfox_md5,f1:threatfox_associated');
+    check('retain tf: the no_result answers are kept too', spy.calls.filter((c) => JSON.parse(c[2].body).query_status === 'no_result').length === 2);
+    check('retain tf: every op fits the host rule', spy.calls.every((c) => /^[a-z][a-z0-9_]{0,63}$/.test(c[1])));
+    check('retain tf: no Auth-Key or request in any of them', leaks(spy.calls).length === 0);
+}
+{
+    const urlBody = { query_status: 'ok', url: 'http://112.232.224.88:41588/i', url_status: 'online', urlhaus_reference: 'https://urlhaus.abuse.ch/url/4065683/', payloads: [{ firstseen: '2026-11-14', response_sha256: '4293c1d8574dc87c58360d6bac3daa182f64f7785c9d41da5e0741d2b1817fc7', signature: null }] };
+    const { t, spy } = withRetain({
+        nodes: { u1: { id: 'u1', type: 'web.url', data: { url: 'http://112.232.224.88:41588/i' } }, d1: { id: 'd1', type: 'infrastructure.domain', data: { domain_name: 'example.org' } } },
+        respond: (url) => (url.endsWith('/url/') ? { status: 200, body: urlBody, headers: RESPONSE_HEADERS } : { status: 200, body: { query_status: 'no_results' } }),
+    });
+    await P.urlhaus.run(t.ctx);
+    check('retain uh: one call per node looked up, op urlhaus, on that node', where(spy.calls) === 'u1:urlhaus,d1:urlhaus');
+    check('retain uh: the URL answer whole, as sent', spy.calls[0]?.[2].body === JSON.stringify(urlBody));
+    check('retain uh: no_results on the domain is kept', JSON.parse(spy.calls[1]?.[2].body ?? '{}').query_status === 'no_results');
+    check('retain uh: the payload node made from it gets no copy', t.graph.createdNodes.length === 1 && !spy.calls.some((c) => c[0] === t.graph.createdNodes[0].id));
+    check('retain uh: shape, and no Auth-Key or request', shapeOk(spy.calls) && leaks(spy.calls).length === 0);
+}
+{
+    // SSLBL downloads one list about every listed certificate: nothing in it is one node's answer.
+    const { t, spy } = withRetain({ nodes: { c1: cert('c1', SHA1) }, respond: (url) => (url.includes('sslbl') ? { status: 200, text: FEED } : { status: 200, body: { query_status: 'ok', data: {} } }) });
+    const r = await run(P.sslbl, t);
+    check('retain sslbl: the downloaded list is never kept', !r.error && t.net.calls.length >= 1 && spy.calls.length === 0);
+}
+{
+    // A refusal is an object, not a throw — and either way the run carries on.
+    const nodes = { a: fileNode({ sha256: SHA256 }), b: { id: 'b', type: 'threat.file_hash', data: { md5: MD5 } }, c: { id: 'c', type: 'threat.file_hash', data: { sha1: SHA1 } } };
+    const respond = () => ({ status: 200, body: { query_status: 'ok', data: [{ ...mbRecord, signature: null }] } });
+    const refuse = retainSpy(async () => ({ kept: false, reason: "over this run's raw-result budget" }));
+    const { t } = withRetain({ nodes, respond }, refuse);
+    const res = await run(P.malwarebazaar, t);
+    check('retain refusal: the lookups still succeed', !res.error && res.counts.found === 3 && refuse.calls.length === 3);
+    check('retain refusal: said once, not once per node', t.logs.filter((l) => l === "Raw malwarebazaar result not kept — over this run's raw-result budget").length === 1);
+
+    const thrower = retainSpy(async () => {
+        throw new Error('host blew up');
+    });
+    const { t: h } = withRetain({ nodes, respond }, thrower);
+    const hres = await run(P.malwarebazaar, h);
+    check('retain throw: the lookups still succeed with everything mapped', !hres.error && hres.counts.found === 3 && h.graph.updates.length === 3);
+    check("retain throw: logged once, without the host's message", h.logs.filter((l) => /Raw malwarebazaar result not kept/.test(l)).length === 1 && !h.logs.some((l) => /blew up/.test(l)));
+}
+{
+    check('pack version is 1.1.0', pack.version === '1.1.0');
+}
+
 for (const n of fail) console.log('FAIL', n);
 console.log(`\n${fail.length ? 'FAIL' : 'PASS'} ${ok.length} / ${ok.length + fail.length}`);
 if (fail.length) process.exit(1);
